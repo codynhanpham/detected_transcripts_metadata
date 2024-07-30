@@ -4,6 +4,8 @@ use std::{
     path::Path,
 };
 
+use memchr;
+
 
 
 /// Check if CSV file is valid
@@ -44,7 +46,26 @@ pub fn validate_detected_transcripts_csv_file(file_path: &Path, col_of_interest:
 
 /// Split line by comma and return a Vec of columns data
 pub fn get_col_data(line: &str) -> Vec<String> {
-    line.split(',').map(|s| s.to_string()).collect()
+    let mut cols = Vec::new();
+    let mut start = 0;
+    let mut end = 0;
+
+    while end < line.len() {
+        match memchr::memchr(b',', &line.as_bytes()[end..]) {
+            Some(pos) => {
+                end += pos;
+                cols.push(line[start..end].to_string());
+                start = end + 1;
+                end += 1;
+            }
+            None => {
+                cols.push(line[start..].to_string());
+                break;
+            }
+        }
+    }
+
+    cols
 }
 
 /// Print column data as (index, value)

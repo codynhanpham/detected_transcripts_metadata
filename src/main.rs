@@ -8,7 +8,7 @@ use std::{
 use clap::Parser;
 use dashmap::DashMap;
 use memchr;
-use memmap::MmapOptions;
+use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -23,7 +23,7 @@ struct Args {
     #[arg(short = 'i', long = "input", required = true)]
     input: String,
 
-    /// Path to save the metadata JSON file.
+    /// Path to save the metadata JSON file
     /// If not provided, the output will be saved in the same directory as the input file
     /// Use special value "-" to print the metadata JSON to console without saving to a file
     #[arg(short = 'o', long = "output", verbatim_doc_comment)]
@@ -32,6 +32,11 @@ struct Args {
     /// Number of lines to process in each chunk
     #[arg(short, long, default_value = "500000")]
     chunk_size: usize,
+
+    /// Number of processes to run in parallel
+    /// Default is the number of logical CPUs in the system
+    #[arg(short = 'p', long = "processes", verbatim_doc_comment)]
+    num_threads: Option<usize>,
 
     /// Run quitely without printing to stdout (except for errors)
     #[arg(short, long, default_value = "false")]
@@ -74,10 +79,9 @@ impl TranscriptMetadata {
             let cell_id = &row[1];
             let gene = &row[2];
 
-            // Increment total transcripts
+            // Increment fields with new chunk data
             *self.total_transcripts.write().unwrap() += 1;
 
-            // Increment transcripts within cells
             if !cell_id.is_empty() && cell_id != "NA" && cell_id != "N/A" && cell_id != "-1" {
                 *self.transcripts_within_cells.write().unwrap() += 1;
                 self.layers_transcripts_within_cells_count
@@ -86,19 +90,16 @@ impl TranscriptMetadata {
                     .or_insert(1);
             }
 
-            // Increment layer transcript count
             self.layers_transcripts_count
                 .entry(global_z)
                 .and_modify(|e| *e += 1)
                 .or_insert(1);
 
-            // Increment gene frequency
             self.genes_frequency
                 .entry(gene.clone())
                 .and_modify(|e| *e += 1)
                 .or_insert(1);
 
-            // Increment gene frequency per layer
             self.genes_frequency_per_layer
                 .entry(global_z)
                 .or_insert(DashMap::new())
@@ -114,14 +115,14 @@ impl TranscriptMetadata {
 fn main() -> io::Result<()> {
     // ----------------- Read input file ----------------- // 
 
-    // Set headers of interest
+    // Set headers of interest. These columns are required and will be used to validate the CSV file
     let col_of_interest = vec!["global_z", "cell_id", "gene"];
 
     let args: Args = Args::parse();
 
     let file_path = Path::new(&args.input);
 
-    // Validate CSV file headers is formatted for detected_transcripts.csv
+    // Validate CSV file is formatted for detected_transcripts.csv
     match utils::validate_detected_transcripts_csv_file(file_path, &col_of_interest) {
         Ok(_) => (),
         Err(e) => {
@@ -130,9 +131,8 @@ fn main() -> io::Result<()> {
         },
     }
     if !args.quiet {
-        println!("Using input file: {:?}", file_path);
+        println!("Processing input file: {:?}", file_path);
     }
-
 
     // If the -o value is not a directory, then it is a file, use the provided filename for the metadata file
     // Otherwise, it is a directory, so make sure the directory exists and use the input filename + "_metadata.csv" for the metadata file
@@ -157,6 +157,14 @@ fn main() -> io::Result<()> {
     
     let print_json_output = args.output.as_ref().map_or(false, |output| output == "-");
 
+    // Set number of parallel processes
+    let available_cpus = std::thread::available_parallelism().unwrap().into();
+    let mut parallel_processes = args.num_threads.unwrap_or_else(|| available_cpus);
+    if parallel_processes == 0 {
+        parallel_processes = available_cpus;
+    }
+
+
 
     // ----------------- Process data ----------------- //
 
@@ -164,70 +172,110 @@ fn main() -> io::Result<()> {
 
     let metadata = Arc::new(TranscriptMetadata::new());
 
-    // Read file in chunks
-    let chunk_size = args.chunk_size;
-    let num_threads: usize = std::thread::available_parallelism().unwrap().into();
+    // Chunk settings
+    let num_threads: usize = parallel_processes;
+    let process_chunk_size = args.chunk_size;
 
 
+    // Strategy: Divide the file into num_threads chunks using the length of the file
+    // At the estimated start byte of each chunk, use memchr to find next newline character
+    // These will be the actual start byte of each chunk for each thread -> Save the chunk start and end bytes
+    // Then, each thread will then discover/scan the lines in their chunk upto the chunk_size at a time
+    // Process the data, repeating the process until the end of the chunk
 
     let file = File::open(file_path)?;
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let mmap = unsafe { Mmap::map(&file)? };
     let mmap_len = mmap.len();
 
-
-    // Without loading the entire file into memory, read the file in chunks:
-    // Discover the lines upto set of chunk_size * num_threads
-    // Stop the seeking, now divide the mmap into num_threads chunks of chunk_size of the current set of lines
-    // Process each chunk in parallel, only use the columns of interest data for processing
-    // After processing the set, seek to the next set of lines and repeat the process
-    let mut start = 0;
+    let mut start_byte = 0;
+    let mut end_byte: usize;
+    let mut start_bytes = Vec::with_capacity(num_threads);
+    let mut end_bytes = Vec::with_capacity(num_threads);
 
     // Skip the first line (headers)
     if let Some(first_newline) = memchr::memchr(b'\n', &mmap) {
-        start = first_newline + 1;
+        start_byte = first_newline + 1;
     }
 
-    let mut total_lines_processed = 0;
+    // Split the file into num_threads chunks
+    let thread_chunk_size = mmap_len / num_threads as usize;
+    for _ in 0..num_threads {
+        start_bytes.push(start_byte);
 
-    while start < mmap_len {
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-
-        // Discover the lines upto set of chunk_size * num_threads
-        let mut lines = Vec::new();
-        let mut line_count = 0;
-
-        while line_count < chunk_size * num_threads {
-            match memchr::memchr(b'\n', &mmap[start..]) {
-                Some(pos) => {
-                    lines.push(&mmap[start..start + pos]);
-                    start += pos + 1;
-                    line_count += 1;
-                },
-                None => {
-                    if start < mmap.len() {
-                        lines.push(&mmap[start..]);
-                    }
-                    start = mmap.len();
-                    break;
-                },
-            }
+        end_byte = start_byte + thread_chunk_size;
+        if end_byte > mmap_len {
+            end_byte = mmap_len;
         }
-
-        if lines.is_empty() {
-            eprintln!("Encountered empty lines, assuming end of file. Stopped scanning lines in file.");
+        if end_byte == mmap_len {
+            end_bytes.push(end_byte);
             break;
         }
-
-        // Divide the mmap into num_threads chunks of chunk_size of the current set of lines
-        let mut chunks: Vec<Vec<&[u8]>> = vec![Vec::new(); num_threads];
-        for (i, line) in lines.iter().enumerate() {
-            chunks[i % num_threads].push(line);
+        // Refine the next start byte to align with the newline character + 1
+        match memchr::memchr(b'\n', &mmap[end_byte..]) {
+            Some(pos) => {
+                end_byte += pos + 1;
+                end_bytes.push(end_byte);
+            },
+            None => {
+                eprintln!("Error: Could not find newline character in chunk. Stopped scanning lines in file.");
+                break;
+            },
         }
+        start_byte = end_byte + 1;
+    }
 
-        // Process each chunk in parallel!!!
-        chunks.into_par_iter().for_each(|chunk| {
-            let mut data_chunk = Vec::new();
-            for line in chunk {
+
+    // Print chunk settings
+    if !args.quiet {
+        println!("Number of threads: {}", num_threads);
+        println!("File length: {} (bytes)", mmap_len);
+        for (i, (start, end)) in start_bytes.iter().zip(end_bytes.iter()).enumerate() {
+            println!("Thread {}: [{}, {}]", i, start, end);
+        }
+        println!();
+    }
+
+    drop(mmap);
+
+
+    // Process chunks in parallel
+    let progress_counter = Arc::new(RwLock::new(0));
+
+    start_bytes.par_iter().zip(end_bytes.par_iter()).for_each(|(start, end)| {
+        let mut local_start = *start;
+
+        while local_start < *end {
+            let mmap = unsafe { Mmap::map(&file).unwrap() };
+
+            let mut lines = Vec::new();
+            let mut line_count = 0;
+
+            while line_count < process_chunk_size && local_start < *end {
+                match memchr::memchr(b'\n', &mmap[local_start..]) {
+                    Some(pos) => {
+                        lines.push(&mmap[local_start..local_start + pos]);
+                        local_start += pos + 1;
+                        line_count += 1;
+                    },
+                    None => {
+                        if local_start < *end {
+                            lines.push(&mmap[local_start..]);
+                        }
+                        local_start = *end;
+                        break;
+                    },
+                }
+            }
+
+            if lines.is_empty() {
+                eprintln!("Encountered empty lines, assuming end of file. Stopped scanning lines in file.");
+                break;
+            }
+
+            // Parse the data chunk
+            // Only collect col_of_interest data for efficiency
+            let mut data_chunk = Vec::with_capacity(lines.len());
+            for line in lines {
                 let line = String::from_utf8_lossy(line).trim().to_string();
                 let row = utils::get_col_data(&line);
                 let data: Result<Vec<String>, &str> = col_of_interest_indices
@@ -248,29 +296,38 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
+
+            // Increment progress counter with lines processed
+            *progress_counter.write().unwrap() += data_chunk.len();
+
+            if !args.quiet {
+                println!("Processed {} lines", *progress_counter.read().unwrap());
+            }
+
+            // Commit the data chunk to the metadata
             metadata.add_data_chunk(&data_chunk);
+
+            // Cleanup
             data_chunk.clear();
-        });
-        total_lines_processed += lines.len();
-        lines.clear();
-        if !args.quiet {
-            println!("Processed {} lines", total_lines_processed);
         }
+    });
+
+    if !args.quiet {
+        println!("\nMetadata compilation of {} transcripts completed.", metadata.total_transcripts.read().unwrap());
     }
+
 
 
     // ----------------- Output results ----------------
     
     let processed_metadata = Arc::try_unwrap(metadata).unwrap();
 
-
-    // If the output value is the special value "-", then do not save the metadata JSON to a file
+    // If the output value is the special value "-", print to console instead of saving to file
     if print_json_output {
         let metadata_json = serde_json::to_string_pretty(&processed_metadata).unwrap();
         println!("{}", metadata_json);
         return Ok(());
     }
-
 
     // Otherwise, save metadata as JSON file
     let metadata_file_path = metadata_file_path.unwrap();
