@@ -69,7 +69,7 @@ pub fn get_col_data(line: &str) -> Vec<String> {
 }
 
 /// Print column data as (index, value)
-pub fn print_col_data(col_data: &Vec<String>) {
+pub fn _print_col_data(col_data: &Vec<String>) {
     for (i, data) in col_data.iter().enumerate() {
         println!("{}:  {}", i, data);
     }
@@ -89,9 +89,9 @@ pub fn get_headers(file_path: &Path) -> io::Result<Vec<String>> {
 }
 
 /// Print header of a CSV file
-pub fn print_header(file_path: &Path) -> io::Result<()> {
+pub fn _print_header(file_path: &Path) -> io::Result<()> {
     let headers = get_headers(file_path)?;
-    print_col_data(&headers);
+    _print_col_data(&headers);
     Ok(())
 }
 

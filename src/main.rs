@@ -1,12 +1,10 @@
 use std::{
-    fs::File,
-    io::{self},
-    path::Path,
-    sync::{Arc, RwLock},
+    fs::File, io::{self}, path::Path, sync::{Arc, RwLock}
 };
 
 use clap::Parser;
 use dashmap::DashMap;
+use fxhash::FxHashSet;
 use memchr;
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -45,19 +43,23 @@ struct Args {
 
 
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 struct TranscriptMetadata {
-    total_transcripts: RwLock<usize>,
-    transcripts_within_cells: RwLock<usize>,
-    layers_transcripts_count: DashMap<i32, usize>,
-    layers_transcripts_within_cells_count: DashMap<i32, usize>,
-    genes_frequency: DashMap<String, usize>,
-    genes_frequency_per_layer: DashMap<i32, DashMap<String, usize>>,
+    cell_set: RwLock<FxHashSet<String>>, // Unique cell set
+    cell_count: RwLock<usize>, // Number of cells
+    total_transcripts: RwLock<usize>, // Total number of transcripts (== number of rows in the file)
+    transcripts_within_cells: RwLock<usize>, // Number of transcripts within cells (cell_id != "NA" or "N/A" or "-1")
+    layers_transcripts_count: DashMap<i32, usize>, // Number of transcripts for each z-layer
+    layers_transcripts_within_cells_count: DashMap<i32, usize>, // Number of transcripts within cells for each z-layer
+    genes_frequency: DashMap<String, usize>, // Frequency of each gene
+    genes_frequency_per_layer: DashMap<i32, DashMap<String, usize>>, // Frequency of each gene per z-layer
 }
 
 impl TranscriptMetadata {
     fn new() -> Self {
         Self {
+            cell_set: RwLock::new(FxHashSet::default()),
+            cell_count: RwLock::new(0),
             total_transcripts: RwLock::new(0),
             transcripts_within_cells: RwLock::new(0),
             layers_transcripts_count: DashMap::new(),
@@ -80,9 +82,11 @@ impl TranscriptMetadata {
             let gene = &row[2];
 
             // Increment fields with new chunk data
+
             *self.total_transcripts.write().unwrap() += 1;
 
             if !cell_id.is_empty() && cell_id != "NA" && cell_id != "N/A" && cell_id != "-1" {
+                self.cell_set.write().unwrap().insert(cell_id.clone());
                 *self.transcripts_within_cells.write().unwrap() += 1;
                 self.layers_transcripts_within_cells_count
                     .entry(global_z)
@@ -107,8 +111,39 @@ impl TranscriptMetadata {
                 .and_modify(|e| *e += 1)
                 .or_insert(1);
         });
+
+        // Update cell count
+        *self.cell_count.write().unwrap() = self.cell_set.read().unwrap().len();
     }
 }
+
+
+/// Struct for exporting metadata to JSON
+#[derive(Debug, Serialize, Deserialize)]
+struct TranscriptMetadataExport {
+    cell_count: usize, // Number of cells
+    total_transcripts: usize, // Total number of transcripts (== number of rows in the file)
+    transcripts_within_cells: usize, // Number of transcripts within cells (cell_id != "NA" or "N/A" or "-1")
+    layers_transcripts_count: DashMap<i32, usize>, // Number of transcripts for each z-layer
+    layers_transcripts_within_cells_count: DashMap<i32, usize>, // Number of transcripts within cells for each z-layer
+    genes_frequency: DashMap<String, usize>, // Frequency of each gene
+    genes_frequency_per_layer: DashMap<i32, DashMap<String, usize>>, // Frequency of each gene per z-layer
+}
+
+impl TranscriptMetadataExport {
+    fn new(metadata: &TranscriptMetadata) -> Self {
+        Self {
+            cell_count: *metadata.cell_count.read().unwrap(),
+            total_transcripts: *metadata.total_transcripts.read().unwrap(),
+            transcripts_within_cells: *metadata.transcripts_within_cells.read().unwrap(),
+            layers_transcripts_count: metadata.layers_transcripts_count.clone(),
+            layers_transcripts_within_cells_count: metadata.layers_transcripts_within_cells_count.clone(),
+            genes_frequency: metadata.genes_frequency.clone(),
+            genes_frequency_per_layer: metadata.genes_frequency_per_layer.clone(),
+        }
+    }
+}
+
 
 
 
@@ -249,7 +284,7 @@ fn main() -> io::Result<()> {
     }
 
     // Split the file into num_threads chunks
-    let thread_chunk_size = mmap_len / num_threads as usize;
+    let thread_chunk_size = (mmap_len - start_byte) / num_threads as usize;
     for _ in 0..num_threads {
         start_bytes.push(start_byte);
 
@@ -281,7 +316,8 @@ fn main() -> io::Result<()> {
         println!("Number of threads: {}", num_threads);
         println!("File length: {} (bytes)", mmap_len);
         for (i, (start, end)) in start_bytes.iter().zip(end_bytes.iter()).enumerate() {
-            println!("Thread {}: [{}, {}]", i, start, end);
+            let percentage = ((end - start) as f64 / (mmap_len - start_bytes[0]) as f64 * 100.0 * 100.0).round() / 100.0;
+            println!("Thread {}: [{}, {}] (~{}%)", i, start, end, percentage);
         }
         println!();
     }
@@ -297,27 +333,31 @@ fn main() -> io::Result<()> {
     // Process chunks in parallel
     let progress_counter = Arc::new(RwLock::new(0));
     let thread_complete = Arc::new(RwLock::new(0));
-
+    
     start_bytes.par_iter().zip(end_bytes.par_iter()).for_each(|(start, end)| {
         let mut local_start = *start;
         let metadata = TranscriptMetadata::new();
 
         while local_start < *end {
             let mmap = unsafe { Mmap::map(&file).unwrap() };
-
+            let mut slice = &mmap[local_start..*end];
             let mut lines = Vec::new();
             let mut line_count = 0;
 
-            while line_count < process_chunk_size && local_start < *end {
-                match memchr::memchr(b'\n', &mmap[local_start..]) {
+            // Dynamically scale the process_chunk_size by the number of threads that have completed processing (at the end of the file)
+            let process_chunk_size = process_chunk_size * (1 + *thread_complete.read().unwrap() / num_threads);
+
+            while line_count < process_chunk_size && !slice.is_empty() {
+                match memchr::memchr(b'\n', slice) {
                     Some(pos) => {
-                        lines.push(&mmap[local_start..local_start + pos]);
+                        lines.push(&slice[..pos]);
+                        slice = &slice[pos + 1..];
                         local_start += pos + 1;
                         line_count += 1;
                     },
                     None => {
-                        if local_start < *end {
-                            lines.push(&mmap[local_start..]);
+                        if !slice.is_empty() {
+                            lines.push(slice);
                         }
                         local_start = *end;
                         break;
@@ -391,7 +431,9 @@ fn main() -> io::Result<()> {
 
 
     // ----------------- Output results ----------------
-    
+
+    let processed_metadata = TranscriptMetadataExport::new(&processed_metadata);
+
     // If the output value is the special value "-", print to console instead of saving to file
     if print_json_output {
         let metadata_json = serde_json::to_string_pretty(&processed_metadata).unwrap();
