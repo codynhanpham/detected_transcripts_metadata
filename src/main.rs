@@ -43,10 +43,9 @@ struct Args {
 
 
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct TranscriptMetadata {
     cell_set: RwLock<FxHashSet<String>>, // Unique cell set
-    cell_count: RwLock<usize>, // Number of cells
     total_transcripts: RwLock<usize>, // Total number of transcripts (== number of rows in the file)
     transcripts_within_cells: RwLock<usize>, // Number of transcripts within cells (cell_id != "NA" or "N/A" or "-1")
     layers_transcripts_count: DashMap<i32, usize>, // Number of transcripts for each z-layer
@@ -59,7 +58,6 @@ impl TranscriptMetadata {
     fn new() -> Self {
         Self {
             cell_set: RwLock::new(FxHashSet::default()),
-            cell_count: RwLock::new(0),
             total_transcripts: RwLock::new(0),
             transcripts_within_cells: RwLock::new(0),
             layers_transcripts_count: DashMap::new(),
@@ -86,6 +84,7 @@ impl TranscriptMetadata {
             *self.total_transcripts.write().unwrap() += 1;
 
             if !cell_id.is_empty() && cell_id != "NA" && cell_id != "N/A" && cell_id != "-1" {
+                // Add cell_id to cell_set
                 self.cell_set.write().unwrap().insert(cell_id.clone());
                 *self.transcripts_within_cells.write().unwrap() += 1;
                 self.layers_transcripts_within_cells_count
@@ -111,9 +110,6 @@ impl TranscriptMetadata {
                 .and_modify(|e| *e += 1)
                 .or_insert(1);
         });
-
-        // Update cell count
-        *self.cell_count.write().unwrap() = self.cell_set.read().unwrap().len();
     }
 }
 
@@ -133,7 +129,7 @@ struct TranscriptMetadataExport {
 impl TranscriptMetadataExport {
     fn new(metadata: &TranscriptMetadata) -> Self {
         Self {
-            cell_count: *metadata.cell_count.read().unwrap(),
+            cell_count: metadata.cell_set.read().unwrap().len(),
             total_transcripts: *metadata.total_transcripts.read().unwrap(),
             transcripts_within_cells: *metadata.transcripts_within_cells.read().unwrap(),
             layers_transcripts_count: metadata.layers_transcripts_count.clone(),
@@ -152,6 +148,7 @@ fn merge_metadata(metadata: Vec<TranscriptMetadata>) -> TranscriptMetadata {
     let merged_metadata = TranscriptMetadata::new();
 
     metadata.into_par_iter().for_each(|data| {
+        *merged_metadata.cell_set.write().unwrap() = data.cell_set.read().unwrap().clone();
         *merged_metadata.total_transcripts.write().unwrap() += *data.total_transcripts.read().unwrap();
         *merged_metadata.transcripts_within_cells.write().unwrap() += *data.transcripts_within_cells.read().unwrap();
 
