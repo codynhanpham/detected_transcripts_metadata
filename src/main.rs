@@ -112,6 +112,59 @@ impl TranscriptMetadata {
 
 
 
+/// Given a Vec<TranscriptMetadata>, merge all the metadata into a single TranscriptMetadata
+fn merge_metadata(metadata: Vec<TranscriptMetadata>) -> TranscriptMetadata {
+    let merged_metadata = TranscriptMetadata::new();
+
+    metadata.into_par_iter().for_each(|data| {
+        *merged_metadata.total_transcripts.write().unwrap() += *data.total_transcripts.read().unwrap();
+        *merged_metadata.transcripts_within_cells.write().unwrap() += *data.transcripts_within_cells.read().unwrap();
+
+        // Extend + Combine the DashMaps:
+        
+        for entry in data.layers_transcripts_count.iter() {
+            let (layer, count) = entry.pair();
+            merged_metadata.layers_transcripts_count
+                .entry(*layer)
+                .and_modify(|e| *e += *count)
+                .or_insert(*count);
+        }
+
+        for entry in data.layers_transcripts_within_cells_count.iter() {
+            let (layer, within_cells_count) = entry.pair();
+            merged_metadata.layers_transcripts_within_cells_count
+                .entry(*layer)
+                .and_modify(|e| *e += *within_cells_count)
+                .or_insert(*within_cells_count);
+        }
+
+        for entry in data.genes_frequency.iter() {
+            let (gene, count) = entry.pair();
+            merged_metadata.genes_frequency
+                .entry(gene.clone())
+                .and_modify(|e| *e += *count)
+                .or_insert(*count);
+        }
+
+        for entry in data.genes_frequency_per_layer.iter() {
+            let (layer, genes_frequency) = entry.pair();
+            for gene_entry in genes_frequency.iter() {
+                let (gene, count) = gene_entry.pair();
+                merged_metadata.genes_frequency_per_layer
+                    .entry(*layer)
+                    .or_insert(DashMap::new())
+                    .entry(gene.clone())
+                    .and_modify(|e| *e += *count)
+                    .or_insert(*count);
+            }
+        }
+    });
+
+    merged_metadata
+}
+
+
+
 fn main() -> io::Result<()> {
     // ----------------- Read input file ----------------- // 
 
@@ -169,8 +222,6 @@ fn main() -> io::Result<()> {
     // ----------------- Process data ----------------- //
 
     let col_of_interest_indices = utils::get_col_indices(&utils::get_headers(file_path).unwrap(), &col_of_interest).unwrap();
-
-    let metadata = Arc::new(TranscriptMetadata::new());
 
     // Chunk settings
     let num_threads: usize = parallel_processes;
@@ -238,11 +289,18 @@ fn main() -> io::Result<()> {
     drop(mmap);
 
 
+    // Vec of Metadata for each thread to be merged at the end
+    // Instead of adding to a shared metadata, this reduces lock contention
+    let metadata_vec = Arc::new(RwLock::new(Vec::with_capacity(num_threads)));
+
+
     // Process chunks in parallel
     let progress_counter = Arc::new(RwLock::new(0));
+    let thread_complete = Arc::new(RwLock::new(0));
 
     start_bytes.par_iter().zip(end_bytes.par_iter()).for_each(|(start, end)| {
         let mut local_start = *start;
+        let metadata = TranscriptMetadata::new();
 
         while local_start < *end {
             let mmap = unsafe { Mmap::map(&file).unwrap() };
@@ -298,9 +356,8 @@ fn main() -> io::Result<()> {
             }
 
             // Increment progress counter with lines processed
-            *progress_counter.write().unwrap() += data_chunk.len();
-
             if !args.quiet {
+                *progress_counter.write().unwrap() += data_chunk.len();
                 println!("Processed {} lines", *progress_counter.read().unwrap());
             }
 
@@ -310,18 +367,31 @@ fn main() -> io::Result<()> {
             // Cleanup
             data_chunk.clear();
         }
+
+        // Push the metadata to the shared metadata vector
+        metadata_vec.write().unwrap().push(metadata);
+
+        if !args.quiet {
+            *thread_complete.write().unwrap() += 1;
+            println!("[{}/{}] threads completed the task", *thread_complete.read().unwrap(), num_threads);
+        }
     });
 
+
+
+    // ----------------- Merge metadata ----------------
+
+    let metadata = Arc::try_unwrap(metadata_vec).unwrap().into_inner().unwrap();
+    let processed_metadata = merge_metadata(metadata);
+
     if !args.quiet {
-        println!("\nMetadata compilation of {} transcripts completed.", metadata.total_transcripts.read().unwrap());
+        println!("\nMetadata compilation of {} transcripts completed.", processed_metadata.total_transcripts.read().unwrap());
     }
 
 
 
     // ----------------- Output results ----------------
     
-    let processed_metadata = Arc::try_unwrap(metadata).unwrap();
-
     // If the output value is the special value "-", print to console instead of saving to file
     if print_json_output {
         let metadata_json = serde_json::to_string_pretty(&processed_metadata).unwrap();

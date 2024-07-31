@@ -37,7 +37,7 @@ pub fn validate_detected_transcripts_csv_file(file_path: &Path, col_of_interest:
     // Read the first line of the CSV file for headers
     let headers = get_headers(file_path)?;
 
-    // Check if the headers of interest are in the CSV file, if not, error and return
+    // Check if the headers of interest are in the CSV file
     match get_col_indices(&headers, col_of_interest) {
         Ok(_) => Ok(()),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
