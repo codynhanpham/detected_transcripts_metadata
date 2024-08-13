@@ -4,7 +4,6 @@ use std::{
 
 use clap::Parser;
 use dashmap::DashMap;
-use fxhash::FxHashSet;
 use memchr;
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -45,7 +44,7 @@ struct Args {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TranscriptMetadata {
-    cell_set: RwLock<FxHashSet<String>>, // Unique cell set
+    cell_set: DashMap<String, usize>, // Cell: Transcript count
     total_transcripts: RwLock<usize>, // Total number of transcripts (== number of rows in the file)
     transcripts_within_cells: RwLock<usize>, // Number of transcripts within cells (cell_id != "NA" or "N/A" or "-1")
     layers_transcripts_count: DashMap<i32, usize>, // Number of transcripts for each z-layer
@@ -57,7 +56,7 @@ struct TranscriptMetadata {
 impl TranscriptMetadata {
     fn new() -> Self {
         Self {
-            cell_set: RwLock::new(FxHashSet::default()),
+            cell_set: DashMap::new(),
             total_transcripts: RwLock::new(0),
             transcripts_within_cells: RwLock::new(0),
             layers_transcripts_count: DashMap::new(),
@@ -84,9 +83,13 @@ impl TranscriptMetadata {
             *self.total_transcripts.write().unwrap() += 1;
 
             if !cell_id.is_empty() && cell_id != "NA" && cell_id != "N/A" && cell_id != "-1" {
-                // Add cell_id to cell_set
-                self.cell_set.write().unwrap().insert(cell_id.clone());
                 *self.transcripts_within_cells.write().unwrap() += 1;
+
+                self.cell_set
+                .entry(cell_id.clone())
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+
                 self.layers_transcripts_within_cells_count
                     .entry(global_z)
                     .and_modify(|e| *e += 1)
@@ -118,6 +121,7 @@ impl TranscriptMetadata {
 #[derive(Debug, Serialize, Deserialize)]
 struct TranscriptMetadataExport {
     cell_count: usize, // Number of cells
+    transcripts_per_cell: Vec<usize>, // Number of transcripts per cell
     total_transcripts: usize, // Total number of transcripts (== number of rows in the file)
     transcripts_within_cells: usize, // Number of transcripts within cells (cell_id != "NA" or "N/A" or "-1")
     layers_transcripts_count: DashMap<i32, usize>, // Number of transcripts for each z-layer
@@ -129,7 +133,8 @@ struct TranscriptMetadataExport {
 impl TranscriptMetadataExport {
     fn new(metadata: &TranscriptMetadata) -> Self {
         Self {
-            cell_count: metadata.cell_set.read().unwrap().len(),
+            cell_count: metadata.cell_set.len(),
+            transcripts_per_cell: metadata.cell_set.iter().map(|entry| *entry.value()).collect(),
             total_transcripts: *metadata.total_transcripts.read().unwrap(),
             transcripts_within_cells: *metadata.transcripts_within_cells.read().unwrap(),
             layers_transcripts_count: metadata.layers_transcripts_count.clone(),
@@ -148,11 +153,19 @@ fn merge_metadata(metadata: Vec<TranscriptMetadata>) -> TranscriptMetadata {
     let merged_metadata = TranscriptMetadata::new();
 
     metadata.into_par_iter().for_each(|data| {
-        *merged_metadata.cell_set.write().unwrap() = data.cell_set.read().unwrap().clone();
+        // Combine the RwLocks:
         *merged_metadata.total_transcripts.write().unwrap() += *data.total_transcripts.read().unwrap();
         *merged_metadata.transcripts_within_cells.write().unwrap() += *data.transcripts_within_cells.read().unwrap();
 
         // Extend + Combine the DashMaps:
+
+        for entry in data.cell_set.iter() {
+            let (cell, count) = entry.pair();
+            merged_metadata.cell_set
+                .entry(cell.clone())
+                .and_modify(|e| *e += *count)
+                .or_insert(*count);
+        }
         
         for entry in data.layers_transcripts_count.iter() {
             let (layer, count) = entry.pair();
@@ -424,7 +437,7 @@ fn main() -> io::Result<()> {
     if !args.quiet {
         println!("\nMetadata compilation of {} transcripts completed.", processed_metadata.total_transcripts.read().unwrap());
     }
-
+    
 
 
     // ----------------- Output results ----------------
