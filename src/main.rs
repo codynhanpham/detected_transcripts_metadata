@@ -3,14 +3,12 @@ use std::{
 };
 
 use clap::Parser;
-use dashmap::DashMap;
 use memchr;
 use memmap2::Mmap;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use serde_json;
 
 mod utils;
+mod transcript_metadata;
 
 
 #[derive(Parser, Debug)]
@@ -26,6 +24,10 @@ struct Args {
     #[arg(short = 'o', long = "output", verbatim_doc_comment)]
     output: Option<String>,
 
+    /// Run quitely without printing to stdout (except for errors)
+    #[arg(short, long, default_value = "false")]
+    quiet: bool,
+
     /// Number of lines to process in each chunk
     #[arg(short, long, default_value = "500000")]
     chunk_size: usize,
@@ -35,178 +37,17 @@ struct Args {
     #[arg(short = 'p', long = "processes", verbatim_doc_comment)]
     num_threads: Option<usize>,
 
-    /// Run quitely without printing to stdout (except for errors)
-    #[arg(short, long, default_value = "false")]
-    quiet: bool,
+    /// Resolution for the transcript mask area calculation
+    /// Default is 60.0 micrometers
+    #[arg(short, long, default_value = "60.0")]
+    resolution: f64,
+
+    /// Minimum number of transcripts required per resolution area to be considered for the mask area calculation
+    /// Default is 1 transcript
+    #[arg(short, long, default_value = "1")]
+    density_threshold: usize,
 }
 
-
-
-#[derive(Debug, Serialize, Deserialize)]
-struct TranscriptMetadata {
-    cell_set: DashMap<String, usize>, // Cell: Transcript count
-    total_transcripts: RwLock<usize>, // Total number of transcripts (== number of rows in the file)
-    transcripts_within_cells: RwLock<usize>, // Number of transcripts within cells (cell_id != "NA" or "N/A" or "-1")
-    layers_transcripts_count: DashMap<i32, usize>, // Number of transcripts for each z-layer
-    layers_transcripts_within_cells_count: DashMap<i32, usize>, // Number of transcripts within cells for each z-layer
-    genes_frequency: DashMap<String, usize>, // Frequency of each gene
-    genes_frequency_per_layer: DashMap<i32, DashMap<String, usize>>, // Frequency of each gene per z-layer
-}
-
-impl TranscriptMetadata {
-    fn new() -> Self {
-        Self {
-            cell_set: DashMap::new(),
-            total_transcripts: RwLock::new(0),
-            transcripts_within_cells: RwLock::new(0),
-            layers_transcripts_count: DashMap::new(),
-            layers_transcripts_within_cells_count: DashMap::new(),
-            genes_frequency: DashMap::new(),
-            genes_frequency_per_layer: DashMap::new(),
-        }
-    }
-
-    fn add_data_chunk(&self, data_chunk: &[Vec<String>]) {
-        data_chunk.par_iter().for_each(|row| {
-            let global_z = match row[0].parse::<f32>() {
-                Ok(z) => z.round() as i32,
-                Err(_) => {
-                    eprintln!("Error: Could not parse global_z value to int32: {}", row[0]);
-                    return;
-                },
-            };
-            let cell_id = &row[1];
-            let gene = &row[2];
-
-            // Increment fields with new chunk data
-
-            *self.total_transcripts.write().unwrap() += 1;
-
-            if !cell_id.is_empty() && cell_id != "NA" && cell_id != "N/A" && cell_id != "-1" {
-                *self.transcripts_within_cells.write().unwrap() += 1;
-
-                self.cell_set
-                .entry(cell_id.clone())
-                .and_modify(|e| *e += 1)
-                .or_insert(1);
-
-                self.layers_transcripts_within_cells_count
-                    .entry(global_z)
-                    .and_modify(|e| *e += 1)
-                    .or_insert(1);
-            }
-
-            self.layers_transcripts_count
-                .entry(global_z)
-                .and_modify(|e| *e += 1)
-                .or_insert(1);
-
-            self.genes_frequency
-                .entry(gene.clone())
-                .and_modify(|e| *e += 1)
-                .or_insert(1);
-
-            self.genes_frequency_per_layer
-                .entry(global_z)
-                .or_insert(DashMap::new())
-                .entry(gene.clone())
-                .and_modify(|e| *e += 1)
-                .or_insert(1);
-        });
-    }
-}
-
-
-/// Struct for exporting metadata to JSON
-#[derive(Debug, Serialize, Deserialize)]
-struct TranscriptMetadataExport {
-    cell_count: usize, // Number of cells
-    transcripts_per_cell: Vec<usize>, // Number of transcripts per cell
-    total_transcripts: usize, // Total number of transcripts (== number of rows in the file)
-    transcripts_within_cells: usize, // Number of transcripts within cells (cell_id != "NA" or "N/A" or "-1")
-    layers_transcripts_count: DashMap<i32, usize>, // Number of transcripts for each z-layer
-    layers_transcripts_within_cells_count: DashMap<i32, usize>, // Number of transcripts within cells for each z-layer
-    genes_frequency: DashMap<String, usize>, // Frequency of each gene
-    genes_frequency_per_layer: DashMap<i32, DashMap<String, usize>>, // Frequency of each gene per z-layer
-}
-
-impl TranscriptMetadataExport {
-    fn new(metadata: &TranscriptMetadata) -> Self {
-        Self {
-            cell_count: metadata.cell_set.len(),
-            transcripts_per_cell: metadata.cell_set.iter().map(|entry| *entry.value()).collect(),
-            total_transcripts: *metadata.total_transcripts.read().unwrap(),
-            transcripts_within_cells: *metadata.transcripts_within_cells.read().unwrap(),
-            layers_transcripts_count: metadata.layers_transcripts_count.clone(),
-            layers_transcripts_within_cells_count: metadata.layers_transcripts_within_cells_count.clone(),
-            genes_frequency: metadata.genes_frequency.clone(),
-            genes_frequency_per_layer: metadata.genes_frequency_per_layer.clone(),
-        }
-    }
-}
-
-
-
-
-/// Given a Vec<TranscriptMetadata>, merge all the metadata into a single TranscriptMetadata
-fn merge_metadata(metadata: Vec<TranscriptMetadata>) -> TranscriptMetadata {
-    let merged_metadata = TranscriptMetadata::new();
-
-    metadata.into_par_iter().for_each(|data| {
-        // Combine the RwLocks:
-        *merged_metadata.total_transcripts.write().unwrap() += *data.total_transcripts.read().unwrap();
-        *merged_metadata.transcripts_within_cells.write().unwrap() += *data.transcripts_within_cells.read().unwrap();
-
-        // Extend + Combine the DashMaps:
-
-        for entry in data.cell_set.iter() {
-            let (cell, count) = entry.pair();
-            merged_metadata.cell_set
-                .entry(cell.clone())
-                .and_modify(|e| *e += *count)
-                .or_insert(*count);
-        }
-        
-        for entry in data.layers_transcripts_count.iter() {
-            let (layer, count) = entry.pair();
-            merged_metadata.layers_transcripts_count
-                .entry(*layer)
-                .and_modify(|e| *e += *count)
-                .or_insert(*count);
-        }
-
-        for entry in data.layers_transcripts_within_cells_count.iter() {
-            let (layer, within_cells_count) = entry.pair();
-            merged_metadata.layers_transcripts_within_cells_count
-                .entry(*layer)
-                .and_modify(|e| *e += *within_cells_count)
-                .or_insert(*within_cells_count);
-        }
-
-        for entry in data.genes_frequency.iter() {
-            let (gene, count) = entry.pair();
-            merged_metadata.genes_frequency
-                .entry(gene.clone())
-                .and_modify(|e| *e += *count)
-                .or_insert(*count);
-        }
-
-        for entry in data.genes_frequency_per_layer.iter() {
-            let (layer, genes_frequency) = entry.pair();
-            for gene_entry in genes_frequency.iter() {
-                let (gene, count) = gene_entry.pair();
-                merged_metadata.genes_frequency_per_layer
-                    .entry(*layer)
-                    .or_insert(DashMap::new())
-                    .entry(gene.clone())
-                    .and_modify(|e| *e += *count)
-                    .or_insert(*count);
-            }
-        }
-    });
-
-    merged_metadata
-}
 
 
 
@@ -214,7 +55,7 @@ fn main() -> io::Result<()> {
     // ----------------- Read input file ----------------- // 
 
     // Set headers of interest. These columns are required and will be used to validate the CSV file
-    let col_of_interest = vec!["global_z", "cell_id", "gene"];
+    let col_of_interest = vec!["global_x", "global_y", "global_z", "cell_id", "gene"];
 
     let args: Args = Args::parse();
 
@@ -224,7 +65,7 @@ fn main() -> io::Result<()> {
     match utils::validate_detected_transcripts_csv_file(file_path, &col_of_interest) {
         Ok(_) => (),
         Err(e) => {
-            eprintln!("Error: {}\nFile is not a valid detected_transcripts.csv or is not formatted properly", e);
+            eprintln!("Error: {}\nFile is not a valid detected_transcripts.csv or is not formatted properly.\nThe following column headers are expected: [ {} ]", e, col_of_interest.join(", "));
             return Ok(());
         },
     }
@@ -264,7 +105,7 @@ fn main() -> io::Result<()> {
 
 
 
-    // ----------------- Process data ----------------- //
+    // ----------------- Process transcripts data ----------------- //
 
     let col_of_interest_indices = utils::get_col_indices(&utils::get_headers(file_path).unwrap(), &col_of_interest).unwrap();
 
@@ -346,7 +187,7 @@ fn main() -> io::Result<()> {
     
     start_bytes.par_iter().zip(end_bytes.par_iter()).for_each(|(start, end)| {
         let mut local_start = *start;
-        let metadata = TranscriptMetadata::new();
+        let metadata = transcript_metadata::TranscriptMetadata::new();
 
         while local_start < *end {
             let mmap = unsafe { Mmap::map(&file).unwrap() };
@@ -431,30 +272,34 @@ fn main() -> io::Result<()> {
 
     // ----------------- Merge metadata ----------------
 
+    if !args.quiet {
+        println!("\nMerging result from {} threads...", num_threads);
+    }
+
     let metadata = Arc::try_unwrap(metadata_vec).unwrap().into_inner().unwrap();
-    let processed_metadata = merge_metadata(metadata);
+    let processed_metadata = transcript_metadata::merge_metadata(metadata);
 
     if !args.quiet {
-        println!("\nMetadata compilation of {} transcripts completed.", processed_metadata.total_transcripts.read().unwrap());
+        println!("Metadata compilation of {} transcripts completed.", processed_metadata.total_transcripts.read().unwrap());
     }
-    
+
+
+    // ----------------- Calculate area covered by the transcripts ----------------
+
+    if !args.quiet {
+        println!("\nCalculating area masked by transcripts...");
+    }
+    processed_metadata.calculate_transcript_mask_area(args.resolution, args.density_threshold);
+    if !args.quiet {
+        println!("Area covered by transcripts: {} sq. micron", processed_metadata.transcripts_mask_area.read().unwrap());
+    }
+
 
 
     // ----------------- Output results ----------------
 
-    let processed_metadata = TranscriptMetadataExport::new(&processed_metadata);
-
-    // If the output value is the special value "-", print to console instead of saving to file
-    if print_json_output {
-        let metadata_json = serde_json::to_string_pretty(&processed_metadata).unwrap();
-        println!("{}", metadata_json);
-        return Ok(());
-    }
-
-    // Otherwise, save metadata as JSON file
-    let metadata_file_path = metadata_file_path.unwrap();
-    let metadata_file = File::create(metadata_file_path).unwrap();
-    serde_json::to_writer(metadata_file, &processed_metadata).unwrap();
-
-    Ok(())
+    processed_metadata.export_json(
+        metadata_file_path.unwrap().to_str().unwrap(),
+        &print_json_output
+    )
 }
