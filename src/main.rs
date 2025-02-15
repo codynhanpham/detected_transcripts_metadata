@@ -111,6 +111,7 @@ fn main() -> io::Result<()> {
 
     // Chunk settings
     let num_threads: usize = parallel_processes;
+    rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global().unwrap();
     let process_chunk_size = args.chunk_size;
 
 

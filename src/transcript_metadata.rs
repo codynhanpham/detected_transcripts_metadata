@@ -9,6 +9,21 @@ use serde_json;
 use ndarray::Array2;
 
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TranscriptHistogram2dData {
+    pub resolution_microns: f64,
+    pub data: Vec<(f64, f64, usize)>, // (x_start_edge, y_start_edge, count)
+}
+
+impl TranscriptHistogram2dData {
+    pub fn new(resolution_microns: f64, data: Vec<(f64, f64, usize)>) -> Self {
+        Self {
+            resolution_microns,
+            data,
+        }
+    }
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TranscriptMetadata {
@@ -21,6 +36,7 @@ pub struct TranscriptMetadata {
     pub genes_frequency_per_layer: DashMap<i32, DashMap<String, usize>>, // Frequency of each gene per z-layer
     pub genes_transcripts_coords: DashMap<String, Vec<(f64, f64, i32)>>, // <gene: (x,y,z)> coord for each transcript
     pub transcripts_mask_area: RwLock<f64>, // Area the transcripts occupy in all layers (area behind the scatter plot)
+    pub transcripts_histogram2d_data: RwLock<TranscriptHistogram2dData>, // 2D histogram data for the transcripts
 }
 
 impl TranscriptMetadata {
@@ -35,6 +51,7 @@ impl TranscriptMetadata {
             genes_frequency_per_layer: DashMap::new(),
             genes_transcripts_coords: DashMap::new(),
             transcripts_mask_area: RwLock::new(-1.0),
+            transcripts_histogram2d_data: RwLock::new(TranscriptHistogram2dData::new(-1.0, vec![])),
         }
     }
 
@@ -125,32 +142,8 @@ impl TranscriptMetadata {
         let genes_coords_matrix = self.get_genes_coords_matrix();
         let (x, y): (Vec<f64>, Vec<f64>) = genes_coords_matrix.par_iter().map(|(x, y, _)| (*x, *y)).unzip();
 
-        let (x_min, x_max, y_min, y_max) = x.par_iter().zip(y.par_iter()).fold(
-            || (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY),
-            |(x_min, x_max, y_min, y_max), (&x, &y)| {
-                (
-                    x_min.min(x),
-                    x_max.max(x),
-                    y_min.min(y),
-                    y_max.max(y),
-                )
-            },
-        )
-        // Update min max values from different threads
-        .reduce(
-            || (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY),
-            |(x_min1, x_max1, y_min1, y_max1), (x_min2, x_max2, y_min2, y_max2)| {
-                (
-                    x_min1.min(x_min2),
-                    x_max1.max(x_max2),
-                    y_min1.min(y_min2),
-                    y_max1.max(y_max2),
-                )
-            },
-        );
-
-        let x_range = (x_min, x_max);
-        let y_range = (y_min, y_max);
+        let x_range = (x.iter().cloned().fold(f64::INFINITY, f64::min), x.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
+        let y_range = (y.iter().cloned().fold(f64::INFINITY, f64::min), y.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
 
         let bin_count = ((x_range.1 - x_range.0) / resolution_microns).round() as usize;
 
@@ -173,6 +166,20 @@ impl TranscriptMetadata {
         let area = over_threshold.sum() as f64 * x_bin_width * y_bin_width;
 
         *self.transcripts_mask_area.write().unwrap() = area;
+
+        // Update the 2D histogram data with x_start_edge, y_start_edge, count
+        let mut data = vec![];
+        for (i, row) in over_threshold.outer_iter().enumerate() {
+            for (j, &count) in row.iter().enumerate() {
+                if count > 0 {
+                    let x_start_edge = x_range.0 + i as f64 * x_bin_width;
+                    let y_start_edge = y_range.0 + j as f64 * y_bin_width;
+                    data.push((x_start_edge, y_start_edge, count));
+                }
+            }
+        }
+
+        *self.transcripts_histogram2d_data.write().unwrap() = TranscriptHistogram2dData::new(resolution_microns, data);
     }
 
     pub fn export_json(&self, metadata_file_output_path: &str, print_json_output_only: &bool) -> io::Result<()> {
@@ -208,6 +215,7 @@ pub struct TranscriptMetadataExport {
     genes_frequency_per_layer: DashMap<i32, DashMap<String, usize>>, // Frequency of each gene per z-layer
     // genes_transcripts_coords: DashMap<String, Vec<(f32, f32, i32)>>, // <gene: (x,y,z)> coord for each transcript
     transcripts_mask_area: f64, // Area the transcripts occupy in all layers (area behind the scatter plot)
+    transcripts_histogram2d_data: TranscriptHistogram2dData, // 2D histogram data for the transcripts
 }
 
 impl TranscriptMetadataExport {
@@ -223,6 +231,7 @@ impl TranscriptMetadataExport {
             genes_frequency_per_layer: metadata.genes_frequency_per_layer.clone(),
             // genes_transcripts_coords: metadata.genes_transcripts_coords.clone(),
             transcripts_mask_area: *metadata.transcripts_mask_area.read().unwrap(),
+            transcripts_histogram2d_data: metadata.transcripts_histogram2d_data.read().unwrap().clone(),
         }
     }
 }
