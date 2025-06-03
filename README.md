@@ -175,3 +175,19 @@ json_string = subprocess.run(
 data = json.loads(json_string.stdout)
 print(data)
 ```
+
+## Build From Source
+
+Simply clone the repository and run the Rust standard build command:
+
+```bash
+git clone https://github.com/codynhanpham/detected_transcripts_metadata.git
+cd detected_transcripts_metadata
+cargo build --release
+```
+
+The executable will be located in the `target/release` directory.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
